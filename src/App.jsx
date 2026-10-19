@@ -145,6 +145,22 @@ function effectiveMacroGoals(goals) {
   };
 }
 
+// Reescala los macros (manteniendo su proporción calórica) para que sumen exactamente las kcal indicadas.
+function macroKcal(g) {
+  return (Number(g.protein) || 0) * 4 + (Number(g.carbs) || 0) * 4 + (Number(g.fat) || 0) * 9;
+}
+function rebalanceMacros(g) {
+  const kcal = Number(g.kcal) || 0;
+  if (kcal <= 0) return g;
+  let p = Number(g.protein) || 0, c = Number(g.carbs) || 0, f = Number(g.fat) || 0;
+  if (!(p > 0 && c > 0 && f > 0)) { p = (kcal * 0.30) / 4; f = (kcal * 0.30) / 9; c = (kcal * 0.40) / 4; }
+  const k = kcal / (p * 4 + c * 4 + f * 9);
+  const protein = Math.round(p * k), fat = Math.round(f * k);
+  // los hidratos absorben el redondeo para que el total cuadre
+  const carbs = Math.max(0, Math.round((kcal - protein * 4 - fat * 9) / 4));
+  return { ...g, protein, fat, carbs };
+}
+
 // ---------- Llamada a Claude (NLU nutricional) ----------
 function extractJSON(rawText) {
   if (!rawText) return null;
@@ -1608,10 +1624,22 @@ function SettingsScreen({ colors, theme, setTheme, goals, setGoals, favorites, s
           <div key={key} className="flex items-center justify-between mb-2">
             <span style={{ fontSize: 13, color: colors.textDim }}>{label}</span>
             <input type="number" value={localGoals[key] || ""} onChange={(e) => setLocalGoals({ ...localGoals, [key]: e.target.value })}
+              onBlur={key === "kcal" ? () => setLocalGoals((g) => rebalanceMacros(g)) : undefined}
               style={{ width: 90, textAlign: "right", padding: "6px 8px", borderRadius: 8, border: `1px solid ${colors.border}`, background: colors.surfaceSoft, color: colors.text }} />
           </div>
         ))}
-        <button onClick={saveGoals} style={{ marginTop: 6, width: "100%", background: colors.accent, color: "#fff", padding: "9px 0", borderRadius: 12, fontSize: 13.5, fontWeight: 600 }}>Guardar objetivos</button>
+        {(() => {
+          const diff = Math.round(macroKcal(localGoals) - (Number(localGoals.kcal) || 0));
+          const hasMacros = localGoals.protein || localGoals.fat || localGoals.carbs;
+          if (!hasMacros) return null;
+          return Math.abs(diff) <= 4
+            ? <div style={{ fontSize: 12, color: colors.accent, marginTop: 4 }}>Los macros cuadran con las calorías.</div>
+            : <div className="flex items-center justify-between" style={{ fontSize: 12, color: colors.textDim, marginTop: 4, gap: 8 }}>
+                <span>Los macros suman {Math.round(macroKcal(localGoals))} kcal ({diff > 0 ? "+" : ""}{diff} respecto al objetivo).</span>
+                <button onClick={() => setLocalGoals((g) => rebalanceMacros(g))} style={{ background: colors.surfaceSoft, color: colors.accent, padding: "5px 10px", borderRadius: 999, fontWeight: 600, whiteSpace: "nowrap" }}>Cuadrar</button>
+              </div>;
+        })()}
+        <button onClick={saveGoals} style={{ marginTop: 10, width: "100%", background: colors.accent, color: "#fff", padding: "9px 0", borderRadius: 12, fontSize: 13.5, fontWeight: 600 }}>Guardar objetivos</button>
       </Card>
 
       <Card colors={colors} style={{ marginBottom: 16 }}>
