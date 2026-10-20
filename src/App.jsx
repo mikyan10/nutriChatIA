@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import {
   Send, MessageCircle, LayoutGrid, History as HistoryIcon, Settings as SettingsIcon,
   Check, X, Trash2, Plus, Flame, Star, ChefHat, Scale, Sun, Moon, ChevronRight, ChevronLeft,
-  Loader2, Sparkles, AlertCircle, Download, Upload, Database, AlertTriangle
+  Loader2, Sparkles, Camera, AlertCircle, Download, Upload, Database, AlertTriangle
 } from "lucide-react";
 import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Tooltip, BarChart, Bar, CartesianGrid } from "recharts";
 
@@ -161,6 +161,38 @@ function rebalanceMacros(g) {
   return { ...g, protein, fat, carbs };
 }
 
+// Reduce la foto en el propio móvil (lado largo 1280 px, JPEG) para que quepa en la función de Netlify.
+function resizeImageToBase64(file, maxSide = 1280, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale)), h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        const dataUrl = canvas.toDataURL("image/jpeg", quality);
+        URL.revokeObjectURL(url);
+        resolve({ data: dataUrl.split(",")[1], mediaType: "image/jpeg", preview: dataUrl });
+      } catch (e) { URL.revokeObjectURL(url); reject(e); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("No se pudo leer la imagen (formato no compatible).")); };
+    img.src = url;
+  });
+}
+
+const PHOTO_RULES = `
+
+MODO FOTO: el usuario adjunta una foto de su plato. Reglas adicionales:
+- Usa intent=log_meal y describe cada alimento visible como un item, con estimated=true.
+- Estima los gramos comparando con referencias visibles (tamaño del plato, cubiertos, envases, manos). Prefiere raciones realistas y no infles las cantidades.
+- Incluye los ingredientes que casi seguro están aunque no se vean (aceite de cocinar en frituras o salteados, salsas evidentes) como items aparte con cantidad prudente.
+- Si el usuario añade texto con cantidades o ingredientes, ese texto manda sobre lo que estimes de la imagen.
+- Si la foto no muestra comida, usa intent=unclear y explícalo en "clarification".
+- La fecha es hoy salvo que el texto indique otra.`;
+
 // ---------- Llamada a Claude (NLU nutricional) ----------
 function extractJSON(rawText) {
   if (!rawText) return null;
@@ -250,7 +282,7 @@ async function fetchClaudeWithRetry(body, maxAttempts = 3) {
   throw lastError;
 }
 
-async function callClaudeInterpreter(userText, context) {
+async function callClaudeInterpreter(userText, context, image) {
   const jsonShape = `{
   "intent": "log_meal" | "edit_meal" | "apply_favorite" | "save_favorite" | "weight_log" | "query" | "unclear",
   "meal_date": "YYYY-MM-DD",
@@ -300,13 +332,21 @@ Reglas de interpretación:
 7. Si el usuario indica su peso ("hoy peso 78,4", "peso: 78.4 kg"), usa intent=weight_log y weight_kg.
 8. Si el usuario pregunta por su progreso ("¿cuánta proteína llevo?", "¿cuántas calorías me quedan?", "enséñame las comidas del martes", "¿qué puedo cenar?"), usa intent=query con query_type y query_date_or_range si aplica. Los números reales los calculará la app, tú solo clasificas la pregunta.
 9. Si el mensaje es ambiguo o no tiene relación con nutrición/peso, usa intent=unclear y una pregunta breve en "clarification".
-Fecha por defecto si no se indica ninguna: ${context.today}.`;
+Fecha por defecto si no se indica ninguna: ${context.today}.${image ? PHOTO_RULES : ""}`;
 
   const body = {
     model: "claude-sonnet-4-6",
-    max_tokens: 1000,
+    max_tokens: image ? 1500 : 1000,
     system,
-    messages: [{ role: "user", content: userText }]
+    messages: [{
+      role: "user",
+      content: image
+        ? [
+            { type: "image", source: { type: "base64", media_type: image.mediaType, data: image.data } },
+            { type: "text", text: userText || "Esta es la foto de mi plato. Estima los alimentos y las cantidades." }
+          ]
+        : userText
+    }]
   };
 
   const data = await fetchClaudeWithRetry(body);
@@ -498,6 +538,9 @@ function ChatScreen({ colors, goals, favorites, setFavorites, habits, setHabits,
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [lastCreatedMeal, setLastCreatedMeal] = useState(null);
+  const [photo, setPhoto] = useState(null);
+  const [photoLoading, setPhotoLoading] = useState(false);
+  const fileRef = useRef(null);
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const { banner, dismiss: dismissBanner } = useNotificationBanner(colors, goals, meals);
@@ -536,12 +579,24 @@ function ChatScreen({ colors, goals, favorites, setFavorites, habits, setHabits,
     return list.length ? Math.max(...list.map((m) => m.mealNumber)) + 1 : 1;
   }
 
+  async function onPhotoPicked(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    setPhotoLoading(true);
+    setError(null);
+    try { setPhoto(await resizeImageToBase64(file)); }
+    catch (err) { setError(err?.message || "No se pudo preparar la foto."); }
+    finally { setPhotoLoading(false); }
+  }
+
   async function handleSend(text) {
     const trimmed = text.trim();
-    if (!trimmed || busy) return;
+    const sentPhoto = photo;
+    if ((!trimmed && !sentPhoto) || busy || photoLoading) return;
     setInput("");
     setError(null);
-    pushMsg({ role: "user", text: trimmed });
+    pushMsg({ role: "user", text: sentPhoto ? (trimmed ? `Foto del plato: ${trimmed}` : "Foto del plato") : trimmed });
     setBusy(true);
     try {
       const today = todayStr();
@@ -561,7 +616,7 @@ function ChatScreen({ colors, goals, favorites, setFavorites, habits, setHabits,
       };
       const normalized = normalizePhrase(trimmed);
       const habit = habits[normalized];
-      if (habit && habit.occurrences >= 3) {
+      if (!sentPhoto && habit && habit.occurrences >= 3) {
         const meal = {
           id: uid(), mealNumber: nextMealNumber(today), date: today, source: "habit",
           rawInput: trimmed, items: habit.items.map((it) => ({ id: uid(), ...it })), createdAt: new Date().toISOString(), habitBased: true
@@ -570,12 +625,14 @@ function ChatScreen({ colors, goals, favorites, setFavorites, habits, setHabits,
         setBusy(false);
         return;
       }
-      const result = await callClaudeInterpreter(trimmed, context);
-      await handleResult(result, trimmed);
+      const result = await callClaudeInterpreter(trimmed, context, sentPhoto);
+      await handleResult(result, trimmed || "Foto del plato");
+      if (sentPhoto) setPhoto(null);
     } catch (e) {
       console.error(e);
       const detail = e?.message || "error desconocido";
-      pushMsg({ role: "assistant", text: `No he podido procesar eso tras varios intentos. Detalle técnico: ${detail}`, retryText: trimmed });
+      pushMsg({ role: "assistant", text: `No he podido procesar eso tras varios intentos. Detalle técnico: ${detail}`, retryText: sentPhoto ? undefined : trimmed });
+      if (sentPhoto) setInput(trimmed);
     } finally {
       setBusy(false);
     }
@@ -783,12 +840,32 @@ function ChatScreen({ colors, goals, favorites, setFavorites, habits, setHabits,
             ))}
           </div>
         )}
+        {(photo || photoLoading) && (
+          <div className="flex items-center gap-2" style={{ marginBottom: 8 }}>
+            {photo ? (
+              <div style={{ position: "relative" }}>
+                <img src={photo.preview} alt="Foto del plato" style={{ width: 56, height: 56, objectFit: "cover", borderRadius: 10, border: `1px solid ${colors.border}` }} />
+                <button onClick={() => setPhoto(null)} aria-label="Quitar foto" style={{ position: "absolute", top: -6, right: -6, width: 20, height: 20, borderRadius: 10, background: colors.text, color: colors.bg, display: "flex", alignItems: "center", justifyContent: "center" }}><X size={12} /></button>
+              </div>
+            ) : <Loader2 size={18} className="animate-spin" color={colors.textDim} />}
+            <span style={{ fontSize: 12, color: colors.textDim }}>
+              {photo ? "Foto lista. Añade cantidades o ingredientes si quieres afinar la estimación." : "Preparando foto…"}
+            </span>
+          </div>
+        )}
         <div className="flex items-center gap-2">
+          <input ref={fileRef} type="file" accept="image/*" onChange={onPhotoPicked} style={{ display: "none" }} />
+          <button onClick={() => fileRef.current && fileRef.current.click()} disabled={busy} aria-label="Añadir foto del plato" style={{
+            width: 42, height: 42, borderRadius: 21, display: "flex", alignItems: "center", justifyContent: "center",
+            background: colors.surfaceSoft, color: colors.accent, border: `1px solid ${colors.border}`, flexShrink: 0, opacity: busy ? 0.5 : 1
+          }}>
+            <Camera size={18} />
+          </button>
           <input
             ref={inputRef}
             value={input} onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter") handleSend(input); }}
-            placeholder="Escribe lo que has comido…"
+            placeholder={photo ? "Añade detalles (opcional)…" : "Escribe lo que has comido…"}
             style={{ flex: 1, background: colors.surfaceSoft, border: `1px solid ${colors.border}`, borderRadius: 20, padding: "10px 14px", fontSize: 14, color: colors.text }}
           />
           <button onClick={() => handleSend(input)} disabled={busy} style={{
